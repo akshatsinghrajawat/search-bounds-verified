@@ -17,6 +17,13 @@
 #define KNUTH_NO_MAIN
 #include "knuth_optimal_bst.cpp"
 
+// Noisy oracle search -- pure algorithm (weighted-median query selection +
+// Bayesian belief update) lives in its own file the same way Knuth's DP
+// does; the Monte Carlo driver that injects the actual randomness (the
+// oracle's lies) lives here, right next to rng() and the other drivers.
+#define NOISY_ORACLE_NO_MAIN
+#include "noisy_oracle_search.cpp"
+
 // ---------------------------------------------------------------------------
 // Config: every range/trial/seed value now flows from here instead of the
 // old LOWER/UPPER globals, so the program can validate its own core claim
@@ -29,6 +36,8 @@ struct Config
     unsigned seed = 0;      // 0 => seed from random_device
     bool jsonOutput = false;
     std::string svgPath;    // empty => no chart written
+    double oracleErrorRate = 0.1;      // noisy-oracle comparison only
+    double oracleConfidence = 0.99;    // stop once a candidate's posterior exceeds this
 };
 
 void printUsage()
@@ -44,7 +53,9 @@ void printUsage()
         "  --trials N           number of simulation trials (default 100000)\n"
         "  --seed N             RNG seed for reproducibility\n"
         "  --json               machine-readable stats output (simulate only)\n"
-        "  --svg PATH            write a bar-chart SVG comparing strategies (simulate only)\n";
+        "  --svg PATH            write a bar-chart SVG comparing strategies (simulate only)\n"
+        "  --oracle-error-rate P probability the noisy oracle answers wrong (default 0.1)\n"
+        "  --oracle-confidence C posterior threshold to stop the noisy search (default 0.99)\n";
 }
 
 Config parseArgs(int argc, char** argv, std::string& command)
@@ -66,9 +77,16 @@ Config parseArgs(int argc, char** argv, std::string& command)
         else if (arg == "--seed") cfg.seed = static_cast<unsigned>(std::stoul(next()));
         else if (arg == "--json") cfg.jsonOutput = true;
         else if (arg == "--svg") cfg.svgPath = next();
+        else if (arg == "--oracle-error-rate") cfg.oracleErrorRate = std::stod(next());
+        else if (arg == "--oracle-confidence") cfg.oracleConfidence = std::stod(next());
         else { std::cerr << "Unknown flag: " << arg << "\n"; printUsage(); std::exit(EXIT_FAILURE); }
     }
     if (cfg.lower >= cfg.upper) { std::cerr << "--min must be less than --max\n"; std::exit(EXIT_FAILURE); }
+    if (cfg.oracleErrorRate < 0.0 || cfg.oracleErrorRate >= 0.5)
+    {
+        std::cerr << "--oracle-error-rate must be in [0, 0.5)\n";
+        std::exit(EXIT_FAILURE);
+    }
     return cfg;
 }
 
@@ -94,6 +112,12 @@ void seedRng(unsigned seed)
 long long uniformInt(long long lo, long long hi)
 {
     std::uniform_int_distribution<long long> dist(lo, hi);
+    return dist(rng());
+}
+
+double uniformReal01()
+{
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
     return dist(rng());
 }
 
@@ -389,6 +413,18 @@ long long knuthSplitYesNoAttempts(long long secretIdx, long long lo, long long h
 // and honest about that limit instead of hanging or crashing.
 constexpr long long kKnuthDpFeasibleN = 2000;
 
+// Same reasoning as kKnuthDpFeasibleN above, different bottleneck: each
+// noisy-search trial costs O(queries * N) -- the belief vector update is
+// O(N) per query, and this algorithm empirically needs ~6x the
+// channel-capacity bound in queries (see noisy_oracle_search.cpp). At the
+// default --trials 100000 that's on the order of 10^9-10^10 operations,
+// which would make a plain `./guess simulate` hang. Capped independently
+// of --trials and --max so the default invocation stays fast; pass
+// smaller --min/--max and a larger --trials explicitly to get a tighter
+// noisy-oracle estimate.
+constexpr long long kNoisyOracleRangeCap = 2000;
+constexpr long long kNoisyOracleTrialCap = 2000;
+
 void runWeightedComparison(long long n, double alpha, long long trials)
 {
     auto weight = zipfWeights(n, alpha);
@@ -450,6 +486,61 @@ void runWeightedComparison(long long n, double alpha, long long trials)
     {
         std::cerr << "WARNING: Knuth-derived yes/no mean fell below the Shannon bound H(p) "
                      "beyond sampling noise -- check for a 3-way/yes-no cost-model mismatch.\n";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bridging the noisy oracle search into the comparison set. Same driver
+// shape as runWeightedComparison above: the pure algorithm lives in
+// noisy_oracle_search.cpp, this function supplies the randomness (both the
+// secret and the oracle's lies) and reports Welford stats against the
+// channel-capacity bound.
+//
+// Unlike binary/entropy/Knuth above, this isn't a hard PASS/FAIL: the
+// implemented algorithm (probabilistic bisection, see noisy_oracle_search.cpp)
+// is provably consistent but not proven to hit the channel-capacity bound in
+// this finite-sample regime, so a gap above the bound is expected, not a
+// failure. What WOULD indicate a real bug is the mean landing below the
+// bound -- see the WARNING check at the end, same shape as the Knuth one
+// above.
+// ---------------------------------------------------------------------------
+void runNoisyOracleComparison(long long n, double errorRate, double confidenceThreshold, long long trials)
+{
+    Welford noisy;
+    long long successes = 0;
+
+    for (long long t = 0; t < trials; ++t)
+    {
+        long long secretIdx = uniformInt(0, n - 1);
+        NoisySearchOutcome outcome = noisySearchAttempts(
+            secretIdx, 0, n - 1, errorRate, confidenceThreshold, /*maxQueries=*/5000, uniformReal01);
+        noisy.add(outcome.attempts);
+        if (outcome.guess == secretIdx) ++successes;
+    }
+
+    double bound = noisyChannelCapacityBound(n, errorRate);
+    double successRate = static_cast<double>(successes) / trials;
+
+    std::cout << "\nNoisy oracle search, N=" << n << ", oracle error rate=" << errorRate
+              << ", confidence threshold=" << confidenceThreshold << ":\n"
+              << "  Probabilistic bisection: mean=" << noisy.mean
+              << " stddev=" << noisy.stddev()
+              << " worst=" << noisy.worst
+              << " success rate=" << successRate << "\n"
+              << "  Channel-capacity bound (log2(N)/(1-H(p))): " << bound
+              << "  <- not met by this algorithm; see noisy_oracle_search.cpp\n";
+
+    // No valid yes/no decision procedure over a binary-symmetric-channel
+    // oracle can beat the channel capacity in expectation -- same logic as
+    // the Shannon-bound checks above. If this ever fires, it means the
+    // belief update or query selection has a real bug, not just a slow
+    // constant.
+    double tol = 3.0 * noisy.stddev() / std::sqrt(static_cast<double>(trials));
+    if (noisy.mean < bound - tol)
+    {
+        std::cerr << "WARNING: noisy oracle search mean fell below the channel-capacity bound "
+                     "beyond sampling noise -- this should be impossible; check the belief "
+                     "update or query selection for a bug.\n";
     }
 }
 
@@ -547,8 +638,9 @@ void writeSvgBarChart(const std::string& path, const std::vector<std::pair<std::
 // against the information-theoretic bound (Flaw #4), reports a 95% CI and a
 // chi-square RNG uniformity check (Flaw #7), demonstrates interpolation
 // search's adversarial collapse (Flaw #3), and runs the entropy-optimal vs.
-// binary-search comparison under a skewed prior (Flaw #2). Optionally emits
-// --json stats and/or a --svg chart (Flaw #8).
+// binary-search comparison under a skewed prior (Flaw #2), and the noisy
+// oracle comparison under an unreliable channel. Optionally emits --json
+// stats and/or a --svg chart (Flaw #8).
 void runSimulation(const Config& cfg)
 {
     long long rangeSize = cfg.upper - cfg.lower + 1;
@@ -622,6 +714,8 @@ void runSimulation(const Config& cfg)
               << "  <- proven collapse, not an empirical accident\n";
 
     runWeightedComparison(rangeSize, 1.0, cfg.trials);
+    runNoisyOracleComparison(std::min(rangeSize, kNoisyOracleRangeCap), cfg.oracleErrorRate,
+                              cfg.oracleConfidence, std::min(cfg.trials, kNoisyOracleTrialCap));
 
     if (cfg.jsonOutput)
     {

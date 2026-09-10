@@ -180,6 +180,113 @@ void test_knuth_split_yesno_never_beats_shannon_bound()
 
     assert(weightedCost > H - 1e-9);
 }
+
+// ---------------------------------------------------------------------------
+// Noisy oracle search tests.
+// ---------------------------------------------------------------------------
+
+void test_noisy_search_degenerates_to_binary_search_at_zero_error_rate()
+{
+    // At errorRate=0, H(0)=0, so the channel-capacity bound is exactly
+    // ceil(log2(N)) -- the same bound binary search meets. The noisy
+    // search's belief update becomes a hard multiply-by-0-or-1 at
+    // errorRate=0, which should make it match binary search's worst case
+    // exactly rather than just "eventually converge."
+    long long n = 1000;
+    auto randReal01 = []() { return 1.0; }; // never below errorRate=0, so never lies
+    long long worst = 0;
+    for (long long secretIdx = 0; secretIdx < n; ++secretIdx)
+    {
+        auto outcome = noisySearchAttempts(secretIdx, 0, n - 1, /*errorRate=*/0.0,
+                                            /*confidenceThreshold=*/0.99, /*maxQueries=*/100, randReal01);
+        assert(outcome.guess == secretIdx);
+        worst = std::max(worst, outcome.attempts);
+    }
+    assert(worst <= informationTheoreticLowerBound(n));
+}
+
+// This is the actual regression test for the bug documented at the top of
+// nextNoisyQuery in noisy_oracle_search.cpp: construct a belief vector by
+// hand where two dominant candidates sit on the same side of the plain
+// weighted-median cut, and confirm the override kicks in and queries
+// strictly between them instead of repeating the useless cut. Without the
+// override, this assertion fails -- the median cut lands at index 3
+// (between candidate 2 and index 3), bundling candidates 1 and 2 together
+// forever.
+void test_top2_bundling_regression()
+{
+    long long n = 10;
+    std::vector<double> belief(n, 0.001);
+    belief[1] = 0.70; // top1
+    belief[2] = 0.20; // top2 -- both on the same side of a naive median cut
+    double sum = 0.0;
+    for (double b : belief) sum += b;
+    for (double& b : belief) b /= sum;
+
+    long long q = nextNoisyQuery(belief, 0, n);
+    // The override must place q strictly between indices 1 and 2 (i.e.
+    // q == 2), separating the two dominant candidates. A plain median cut
+    // would instead land at/after index 2, bundling them.
+    assert(q == 2);
+}
+
+// Companion to the regression test above: confirms the 4x-live-uniform
+// threshold actually gates the override. Early in a search the belief is
+// still near-uniform, and forcing a split between the top-2 "candidates"
+// (which are just noise-level near-ties at that point) degrades the
+// search into scanning adjacent indices one at a time -- this was the
+// first, wrong version of the fix. With a genuinely near-uniform belief,
+// nextNoisyQuery should return the plain median cut, not an adjacent-index
+// split.
+void test_top2_override_does_not_fire_near_uniform()
+{
+    long long n = 1000;
+    std::vector<double> belief(n, 1.0 / n);
+    // Perturb two arbitrary indices by a tiny, sub-threshold amount --
+    // nowhere near the 4x-uniform bar -- so there's a well-defined top-2
+    // without triggering the override.
+    belief[500] += 1e-6;
+    belief[501] += 1e-6;
+    double sum = 0.0;
+    for (double b : belief) sum += b;
+    for (double& b : belief) b /= sum;
+
+    long long q = nextNoisyQuery(belief, 0, n);
+    // Should be the plain weighted median (close to the middle of the
+    // range), not adjacent to index 500/501.
+    assert(q > 10 && q < n - 10);
+}
+
+void test_noisy_search_never_beats_channel_capacity_bound()
+{
+    // Same logic as test_entropy_optimal_never_beats_shannon_bound and
+    // test_knuth_split_yesno_never_beats_shannon_bound: no valid yes/no
+    // decision procedure over a channel with a fixed error rate can beat
+    // channel capacity in expectation. If this ever fires, the belief
+    // update or query selection has a real correctness bug -- being
+    // slower than the bound is expected (see noisy_oracle_search.cpp's
+    // file header); being FASTER than it is not.
+    long long n = 500;
+    double errorRate = 0.1;
+    long long trials = 1500;
+    std::mt19937 gen(2024);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    auto randReal01 = [&]() { return unit(gen); };
+    std::uniform_int_distribution<long long> secretDist(0, n - 1);
+
+    Welford stats;
+    for (long long t = 0; t < trials; ++t)
+    {
+        long long secretIdx = secretDist(gen);
+        auto outcome = noisySearchAttempts(secretIdx, 0, n - 1, errorRate, 0.99, 5000, randReal01);
+        stats.add(outcome.attempts);
+    }
+
+    double bound = noisyChannelCapacityBound(n, errorRate);
+    double tol = 3.0 * stats.stddev() / std::sqrt(static_cast<double>(trials));
+    assert(stats.mean >= bound - tol);
+}
+
 int main()
 {
     test_information_theoretic_bound_edge_cases();
@@ -191,6 +298,10 @@ int main()
     test_knuth_optimal_bst_beats_naive_on_skewed_frequencies();
     test_knuth_bst_search_attempts_matches_expected_cost();
     test_knuth_split_yesno_never_beats_shannon_bound();
+    test_noisy_search_degenerates_to_binary_search_at_zero_error_rate();
+    test_top2_bundling_regression();
+    test_top2_override_does_not_fire_near_uniform();
+    test_noisy_search_never_beats_channel_capacity_bound();
     std::cout << "All tests passed.\n";
     return 0;
 }
