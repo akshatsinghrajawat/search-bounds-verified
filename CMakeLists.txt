@@ -9,6 +9,22 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
 endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
+
+# Windows/MinGW: at runtime, Windows resolves libstdc++-6.dll by searching
+# PATH, and it's common to have more than one on PATH -- e.g. one bundled
+# with Git for Windows, another from the MSYS2 toolchain that actually
+# built these binaries. If an older/mismatched DLL loads instead of the
+# one this was compiled against, std::string/std::vector's internal
+# layout disagrees across that boundary and the first substantial
+# string/vector work segfaults -- confirmed via gdb backtrace pointing
+# into libstdc++-6.dll from inside writeSvgLineChart (see the "Nine real
+# bugs" list in the README). Static-linking the runtime removes the DLL
+# dependency entirely, so there's nothing left for PATH order to get
+# wrong. No effect on non-Windows builds.
+if(MINGW)
+    add_link_options(-static-libgcc -static-libstdc++)
+endif()
+
 add_executable(guess number_guessing_game.cpp)
 add_executable(tests tests.cpp)
 add_executable(knuth_bst knuth_optimal_bst.cpp)

@@ -38,6 +38,7 @@ struct Config
     std::string svgPath;    // empty => no chart written
     double oracleErrorRate = 0.1;      // noisy-oracle comparison only
     double oracleConfidence = 0.99;    // stop once a candidate's posterior exceeds this
+    std::string oracleSvgPath;         // empty => no noisy-oracle sweep chart written
 };
 
 void printUsage()
@@ -55,7 +56,9 @@ void printUsage()
         "  --json               machine-readable stats output (simulate only)\n"
         "  --svg PATH            write a bar-chart SVG comparing strategies (simulate only)\n"
         "  --oracle-error-rate P probability the noisy oracle answers wrong (default 0.1)\n"
-        "  --oracle-confidence C posterior threshold to stop the noisy search (default 0.99)\n";
+        "  --oracle-confidence C posterior threshold to stop the noisy search (default 0.99)\n"
+        "  --oracle-svg PATH     write a line chart: measured queries vs. channel-capacity\n"
+        "                        bound, swept across oracle error rates (simulate only)\n";
 }
 
 Config parseArgs(int argc, char** argv, std::string& command)
@@ -79,6 +82,7 @@ Config parseArgs(int argc, char** argv, std::string& command)
         else if (arg == "--svg") cfg.svgPath = next();
         else if (arg == "--oracle-error-rate") cfg.oracleErrorRate = std::stod(next());
         else if (arg == "--oracle-confidence") cfg.oracleConfidence = std::stod(next());
+        else if (arg == "--oracle-svg") cfg.oracleSvgPath = next();
         else { std::cerr << "Unknown flag: " << arg << "\n"; printUsage(); std::exit(EXIT_FAILURE); }
     }
     if (cfg.lower >= cfg.upper) { std::cerr << "--min must be less than --max\n"; std::exit(EXIT_FAILURE); }
@@ -425,6 +429,15 @@ constexpr long long kKnuthDpFeasibleN = 2000;
 constexpr long long kNoisyOracleRangeCap = 2000;
 constexpr long long kNoisyOracleTrialCap = 2000;
 
+// The sweep (runNoisyOracleSweep, feeds --oracle-svg) runs 9 rates x
+// trialsPerPoint each -- at kNoisyOracleRangeCap's N=2000 that's slow
+// enough to make chart generation itself annoying (measured ~30s on the
+// README's own documented --max 100000 --trials 100000 command). The
+// point of the chart is visible clearly at a smaller N; capped
+// independently to keep --oracle-svg fast regardless of --max/--trials.
+constexpr long long kNoisyOracleSweepRangeCap = 300;
+constexpr long long kNoisyOracleSweepTrialsPerPoint = 300;
+
 void runWeightedComparison(long long n, double alpha, long long trials)
 {
     auto weight = zipfWeights(n, alpha);
@@ -495,18 +508,21 @@ void runWeightedComparison(long long n, double alpha, long long trials)
 // noisy_oracle_search.cpp, this function supplies the randomness (both the
 // secret and the oracle's lies) and reports Welford stats against the
 // channel-capacity bound.
-//
-// Unlike binary/entropy/Knuth above, this isn't a hard PASS/FAIL: the
-// implemented algorithm (probabilistic bisection, see noisy_oracle_search.cpp)
-// is provably consistent but not proven to hit the channel-capacity bound in
-// this finite-sample regime, so a gap above the bound is expected, not a
-// failure. What WOULD indicate a real bug is the mean landing below the
-// bound -- see the WARNING check at the end, same shape as the Knuth one
-// above.
 // ---------------------------------------------------------------------------
-void runNoisyOracleComparison(long long n, double errorRate, double confidenceThreshold, long long trials)
+struct NoisyOracleTrialStats
 {
-    Welford noisy;
+    Welford stats;
+    double bound;
+    double successRate;
+};
+
+// Shared by runNoisyOracleComparison (single error rate, printed report)
+// and runNoisyOracleSweep (many error rates, feeds the SVG line chart) --
+// same measurement, two different consumers.
+NoisyOracleTrialStats measureNoisyOracle(long long n, double errorRate, double confidenceThreshold,
+                                          long long trials)
+{
+    NoisyOracleTrialStats result;
     long long successes = 0;
 
     for (long long t = 0; t < trials; ++t)
@@ -514,20 +530,33 @@ void runNoisyOracleComparison(long long n, double errorRate, double confidenceTh
         long long secretIdx = uniformInt(0, n - 1);
         NoisySearchOutcome outcome = noisySearchAttempts(
             secretIdx, 0, n - 1, errorRate, confidenceThreshold, /*maxQueries=*/5000, uniformReal01);
-        noisy.add(outcome.attempts);
+        result.stats.add(outcome.attempts);
         if (outcome.guess == secretIdx) ++successes;
     }
 
-    double bound = noisyChannelCapacityBound(n, errorRate);
-    double successRate = static_cast<double>(successes) / trials;
+    result.bound = noisyChannelCapacityBound(n, errorRate);
+    result.successRate = static_cast<double>(successes) / trials;
+    return result;
+}
+
+// Unlike binary/entropy/Knuth above, this isn't a hard PASS/FAIL: the
+// implemented algorithm (probabilistic bisection, see noisy_oracle_search.cpp)
+// is provably consistent but not proven to hit the channel-capacity bound in
+// this finite-sample regime, so a gap above the bound is expected, not a
+// failure. What WOULD indicate a real bug is the mean landing below the
+// bound -- see the WARNING check at the end, same shape as the Knuth one
+// above.
+void runNoisyOracleComparison(long long n, double errorRate, double confidenceThreshold, long long trials)
+{
+    auto result = measureNoisyOracle(n, errorRate, confidenceThreshold, trials);
 
     std::cout << "\nNoisy oracle search, N=" << n << ", oracle error rate=" << errorRate
               << ", confidence threshold=" << confidenceThreshold << ":\n"
-              << "  Probabilistic bisection: mean=" << noisy.mean
-              << " stddev=" << noisy.stddev()
-              << " worst=" << noisy.worst
-              << " success rate=" << successRate << "\n"
-              << "  Channel-capacity bound (log2(N)/(1-H(p))): " << bound
+              << "  Probabilistic bisection: mean=" << result.stats.mean
+              << " stddev=" << result.stats.stddev()
+              << " worst=" << result.stats.worst
+              << " success rate=" << result.successRate << "\n"
+              << "  Channel-capacity bound (log2(N)/(1-H(p))): " << result.bound
               << "  <- not met by this algorithm; see noisy_oracle_search.cpp\n";
 
     // No valid yes/no decision procedure over a binary-symmetric-channel
@@ -535,13 +564,41 @@ void runNoisyOracleComparison(long long n, double errorRate, double confidenceTh
     // the Shannon-bound checks above. If this ever fires, it means the
     // belief update or query selection has a real bug, not just a slow
     // constant.
-    double tol = 3.0 * noisy.stddev() / std::sqrt(static_cast<double>(trials));
-    if (noisy.mean < bound - tol)
+    double tol = 3.0 * result.stats.stddev() / std::sqrt(static_cast<double>(trials));
+    if (result.stats.mean < result.bound - tol)
     {
         std::cerr << "WARNING: noisy oracle search mean fell below the channel-capacity bound "
                      "beyond sampling noise -- this should be impossible; check the belief "
                      "update or query selection for a bug.\n";
     }
+}
+
+// Sweeps the oracle error rate at a fixed N and returns, for each rate, the
+// measured mean query count against the channel-capacity bound -- the data
+// behind the "~6x gap, consistently, not just in a tail" claim in the
+// README. Feeds writeSvgLineChart below; kept separate from
+// runNoisyOracleComparison so the single-rate report and the sweep don't
+// have to share a print format.
+struct NoisyOracleSweepPoint
+{
+    double errorRate;
+    double measuredMean;
+    double bound;
+};
+
+std::vector<NoisyOracleSweepPoint> runNoisyOracleSweep(long long n, double confidenceThreshold,
+                                                         long long trialsPerPoint)
+{
+    std::vector<double> rates = {0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4};
+    std::vector<NoisyOracleSweepPoint> points;
+    points.reserve(rates.size());
+
+    for (double rate : rates)
+    {
+        auto result = measureNoisyOracle(n, rate, confidenceThreshold, trialsPerPoint);
+        points.push_back({rate, result.stats.mean, result.bound});
+    }
+    return points;
 }
 
 double confidenceHalfWidth95(double stddev, long long n)
@@ -630,6 +687,131 @@ void writeSvgBarChart(const std::string& path, const std::vector<std::pair<std::
             << label << "</text>\n";
         x += barWidth + gap;
     }
+    out << "</svg>\n";
+}
+
+// Pure C++ SVG line chart, same "no external library" approach as
+// writeSvgBarChart above -- this is the visual behind the "~6x gap,
+// consistently, not just a heavy tail" claim about the noisy oracle
+// search: two lines (measured mean, channel-capacity bound) plotted
+// against the oracle error rate. Where they'd meet if the algorithm were
+// bandwidth-optimal (they don't) is the whole point of the picture.
+//
+// Both series are assumed non-negative and share one linear y-axis --
+// unlike the bar chart, there's no log-scale need here since the two
+// series stay within the same order of magnitude across the swept range.
+void writeSvgLineChart(const std::string& path, const std::string& title,
+                        const std::string& xLabel,
+                        const std::vector<double>& xValues,
+                        const std::vector<std::pair<std::string, std::vector<double>>>& series)
+{
+    const int width = 520, height = 320;
+    const int plotLeft = 55, plotRight = width - 20, plotTop = 40, plotBottom = height - 50;
+    const char* colors[] = {"#4472C4", "#ED7D31", "#70AD47", "#FFC000"};
+
+    double maxY = 0.0;
+    for (size_t s = 0; s < series.size(); ++s)
+        for (size_t i = 0; i < series[s].second.size(); ++i)
+            maxY = std::max(maxY, series[s].second[i]);
+    if (maxY <= 0.0) maxY = 1.0;
+    double minX = xValues.empty() ? 0.0 : xValues.front();
+    double maxX = xValues.empty() ? 1.0 : xValues.back();
+    double xRange = (maxX > minX) ? (maxX - minX) : 1.0;
+
+    // Two plain functions instead of a pair-returning lambda + structured
+    // binding. NOTE: this rewrite was an initial (wrong) guess at a crash
+    // that turned out to have a different cause entirely -- see the
+    // "Nine real bugs" list in the README for what it actually was (a
+    // Windows libstdc++ DLL version mismatch, fixed in CMakeLists.txt,
+    // not in this file). Kept this version anyway since it's no worse
+    // than the structured-binding one and one fewer moving part to
+    // reason about.
+    struct Scale
+    {
+        int plotLeft, plotRight, plotTop, plotBottom;
+        double minX, xRange, maxY;
+
+        double toPxX(double x) const
+        {
+            return plotLeft + (x - minX) / xRange * (plotRight - plotLeft);
+        }
+        double toPxY(double y) const
+        {
+            return plotBottom - (y / maxY) * (plotBottom - plotTop);
+        }
+    };
+    Scale scale{plotLeft, plotRight, plotTop, plotBottom, minX, xRange, maxY};
+
+    std::ofstream out(path);
+    if (!out)
+    {
+        std::cerr << "Could not open " << path << " for writing\n";
+        return;
+    }
+
+    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height << "\">\n"
+        << "  <rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n"
+        << "  <text x=\"" << (width / 2) << "\" y=\"20\" font-size=\"14\" text-anchor=\"middle\" "
+        << "font-family=\"sans-serif\" font-weight=\"bold\">" << title << "</text>\n"
+        << "  <line x1=\"" << plotLeft << "\" y1=\"" << plotBottom << "\" x2=\"" << plotRight
+        << "\" y2=\"" << plotBottom << "\" stroke=\"black\"/>\n"
+        << "  <line x1=\"" << plotLeft << "\" y1=\"" << plotTop << "\" x2=\"" << plotLeft
+        << "\" y2=\"" << plotBottom << "\" stroke=\"black\"/>\n"
+        << "  <text x=\"" << (width / 2) << "\" y=\"" << (height - 10)
+        << "\" font-size=\"12\" text-anchor=\"middle\" font-family=\"sans-serif\">" << xLabel << "</text>\n";
+
+    // A handful of horizontal gridlines with y-axis labels, purely so the
+    // two curves' actual values are readable, not just their shapes.
+    const int gridLines = 5;
+    for (int g = 0; g <= gridLines; ++g)
+    {
+        double val = maxY * g / gridLines;
+        double gy = scale.toPxY(val);
+        out << "  <line x1=\"" << plotLeft << "\" y1=\"" << gy << "\" x2=\"" << plotRight
+            << "\" y2=\"" << gy << "\" stroke=\"#DDDDDD\"/>\n"
+            << "  <text x=\"" << (plotLeft - 8) << "\" y=\"" << (gy + 4)
+            << "\" font-size=\"10\" text-anchor=\"end\" font-family=\"sans-serif\">"
+            << static_cast<int>(val) << "</text>\n";
+    }
+
+    // X-axis tick labels, one per data point -- gridLines above only
+    // labels the y-axis, so without this the reader can't read off which
+    // error rate a given point corresponds to.
+    for (size_t i = 0; i < xValues.size(); ++i)
+    {
+        double tx = scale.toPxX(xValues[i]);
+        out << "  <text x=\"" << tx << "\" y=\"" << (plotBottom + 14)
+            << "\" font-size=\"9\" text-anchor=\"middle\" font-family=\"sans-serif\">"
+            << xValues[i] << "</text>\n";
+    }
+
+    int colorIdx = 0;
+    int legendY = plotTop + 10;
+    for (size_t s = 0; s < series.size(); ++s)
+    {
+        const std::string& label = series[s].first;
+        const std::vector<double>& values = series[s].second;
+        const char* color = colors[colorIdx % 4];
+
+        out << "  <polyline fill=\"none\" stroke=\"" << color << "\" stroke-width=\"2\" points=\"";
+        for (size_t i = 0; i < values.size() && i < xValues.size(); ++i)
+        {
+            out << scale.toPxX(xValues[i]) << "," << scale.toPxY(values[i]) << " ";
+        }
+        out << "\"/>\n";
+        for (size_t i = 0; i < values.size() && i < xValues.size(); ++i)
+        {
+            out << "  <circle cx=\"" << scale.toPxX(xValues[i]) << "\" cy=\"" << scale.toPxY(values[i])
+                << "\" r=\"3\" fill=\"" << color << "\"/>\n";
+        }
+        out << "  <rect x=\"" << (plotLeft + 10) << "\" y=\"" << (legendY - 8)
+            << "\" width=\"10\" height=\"10\" fill=\"" << color << "\"/>\n"
+            << "  <text x=\"" << (plotLeft + 25) << "\" y=\"" << legendY
+            << "\" font-size=\"11\" font-family=\"sans-serif\">" << label << "</text>\n";
+        legendY += 16;
+        ++colorIdx;
+    }
+
     out << "</svg>\n";
 }
 
@@ -738,6 +920,27 @@ void runSimulation(const Config& cfg)
             {"interp", interp.mean},
         }, /*logScale=*/true);
         std::cout << "Wrote chart to " << cfg.svgPath << " (log-scaled bars; labels show real means)\n";
+    }
+
+    if (!cfg.oracleSvgPath.empty())
+    {
+        // Capped independently of --trials for the same reason
+        // kNoisyOracleTrialCap exists: 9 sweep points x O(queries * N) each
+        // would otherwise scale straight into the same slowdown.
+        auto sweep = runNoisyOracleSweep(std::min(rangeSize, kNoisyOracleSweepRangeCap), cfg.oracleConfidence,
+                                          std::min(cfg.trials, kNoisyOracleSweepTrialsPerPoint));
+        std::vector<double> rates, measured, bounds;
+        for (const auto& pt : sweep)
+        {
+            rates.push_back(pt.errorRate);
+            measured.push_back(pt.measuredMean);
+            bounds.push_back(pt.bound);
+        }
+        writeSvgLineChart(cfg.oracleSvgPath, "Noisy oracle: measured vs. channel-capacity bound",
+                           "oracle error rate", rates,
+                           {{"measured mean queries", measured}, {"channel-capacity bound", bounds}});
+        std::cout << "Wrote oracle sweep chart to " << cfg.oracleSvgPath
+                  << " (the visible gap between the two lines is the point -- see README)\n";
     }
 }
 
