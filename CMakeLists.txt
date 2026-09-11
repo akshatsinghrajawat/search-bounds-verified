@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(optimal_search_strategies CXX)
+project(search_bounds_verified CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Default to Release if the user doesn't specify a build type, so a plain

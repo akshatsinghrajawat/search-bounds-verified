@@ -1,6 +1,6 @@
-# optimal-search-strategies
+# search-bounds-verified
 
-![CI](https://github.com/akshatsinghrajawat/optimal-search-strategies/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/akshatsinghrajawat/search-bounds-verified/actions/workflows/ci.yml/badge.svg)
 
 Empirically verifying information-theoretic lower bounds on search strategies -- and checking each claim against real data instead of just asserting it.
 
