@@ -2,12 +2,14 @@
 guess
 tests
 knuth_bst
+noisy_search
 
 # Build artifacts and generated files
 *.o
 *.exe
 *.svg
 !monte_carlo_chart.svg
+!noisy_oracle_chart.svg
 build/
 
 # Editor / IDE settings
