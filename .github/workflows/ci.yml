@@ -15,3 +15,7 @@ jobs:
         run: g++ -std=c++17 -Wall -Wextra -Wpedantic knuth_optimal_bst.cpp -o knuth_bst
       - name: Run Knuth optimal BST demo
         run: ./knuth_bst
+      - name: Build noisy oracle search demo
+        run: g++ -std=c++17 -Wall -Wextra -Wpedantic noisy_oracle_search.cpp -o noisy_search
+      - name: Run noisy oracle search demo
+        run: ./noisy_search
